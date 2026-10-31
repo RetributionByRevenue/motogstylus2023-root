@@ -1,0 +1,5 @@
+qemu-setup/
+*.o
+*.pyc
+__pycache__/
+ghostlock
