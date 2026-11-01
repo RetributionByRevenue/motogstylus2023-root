@@ -97,20 +97,7 @@ struct kernel_offsets {
 
 static const struct kernel_offsets known_offsets[] = {
   /* Add new devices by creating src/devices/<name>/offsets.h */
-#include "ace6t/offsets.h"
-#include "op13/offsets.h"
-#include "op15/offsets.h"
-#include "findx9ultra/offsets.h"
-#include "pudding/offsets.h"
-#include "pad4pro/offsets.h"
-#include "cph2521/offsets.h"
-#include "vivot4/offsets.h"
-#include "vivoxfold3pro/offsets.h"
-#include "xperia1iv/offsets.h"
-#include "xperia1vi/offsets.h"
 #include "genevn/offsets.h"
-#include "findx9pro/offsets.h"
-#include "vivox200ultra/offsets.h"
   { .uname_r = NULL }
 };
 

