@@ -16,6 +16,7 @@ GhostLock (CVE-2026-43499) via USB adb. No bootloader unlock, no flashing.
 | `sample-success.log` | What a successful run looks like |
 | `src/` | Complete exploit source code — build it yourself, study the mechanism |
 | `tools/` | Python helpers for extracting kernel offsets from a vmlinux / BTF |
+| `tools/BakaSU-v4.2.0-rc3.apk` | Root manager APK (known working version) |
 | `full-writeup/` | The complete project history: bugs found, pivots, confirmed findings |
 
 ## Device Details
@@ -34,9 +35,13 @@ GhostLock (CVE-2026-43499) via USB adb. No bootloader unlock, no flashing.
 ## Requirements
 
 - USB debugging enabled, adb working
-- **ReSukiSU** app installed on the phone (`com.resukisu.resukisu`) — it supplies
-  `libksud.so` and is the root-manager UI
-- WiFi **off** (avoid OTA exposure and reduce background kernel activity)
+- **Airplane mode ON** (or at minimum WiFi off) before running the exploit —
+  network activity generates kernel interrupts and workqueue churn that compete
+  with the race window, significantly reducing the landing rate
+- **BakaSU v4.2.0-rc3** (formerly ReSukiSU) installed on the phone
+  (`com.resukisu.resukisu`) — it supplies `libksud.so` and is the root-manager
+  UI. This specific version is known to work; other versions may not. A copy of
+  the APK is included at `tools/BakaSU-v4.2.0-rc3.apk`
 - The `ksud` binary and KernelSU `.ko` module pushed to `/data/local/tmp/`
   (the exploit loads the module automatically from a root shell)
 
@@ -107,10 +112,11 @@ adb shell su -c id
   it. After every reboot, re-run the exploit. Expect roughly a 50%
   landing rate per boot — if it exits without `[+] KernelSU ready`, just reboot
   and run it again (1–3 tries is normal).
-- Termux and other apps need a one-time grant in the ReSukiSU **Superuser** tab.
-  The grant resets on reboot — re-grant after re-rooting.
-- **Do not take OTA updates** while rooted, and keep WiFi off to avoid them.
-  An OTA on a locked bootloader with kernel patching is a brick risk.
+- Termux and other apps need a one-time grant in the BakaSU **Superuser**
+  tab. The grant resets on reboot — re-grant after re-rooting.
+- **Do not take OTA updates** while rooted — an OTA on a locked bootloader with
+  kernel patching is a brick risk. Once rooted you can kill automatic updates:
+  `su -c 'pm disable-user com.motorola.ccc.ota && settings put global ota_disable_automatic_update 1'`
 - A panic during a run is possible — the phone simply reboots; retry.
 - If the phone lands in **fastboot mode** after a crash, run `fastboot reboot`
   from your PC to boot it back to Android.
